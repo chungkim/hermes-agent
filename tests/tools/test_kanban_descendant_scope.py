@@ -6,6 +6,8 @@ import shlex
 import subprocess
 import sys
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 from tools import kanban_tools
@@ -156,3 +158,116 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
     scratch_conn = connect(scratch_home / "kanban.db")
     assert kb.get_task(scratch_conn, row["scratch"]).title == "scratch"
     scratch_conn.close()
+
+
+def _fenced_descendant_env(monkeypatch, tmp_path, home):
+    """The live condition: an inherited fence marker over the lineage's own board
+    with NO ``HERMES_KANBAN_TASK`` -- inherited scope, not a dispatcher worker."""
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", str(home))
+
+
+def test_fenced_descendant_can_list_without_a_write(tmp_path, monkeypatch):
+    """RED regression for the live ``kanban_list`` fence error.
+
+    ``_handle_list`` called ``kb.recompute_ready(conn)``, which opens ``write_txn``
+    -> ``_assert_not_delegated_child_mutation`` and raised
+    ``PermissionError: delegate_task child contexts cannot mutate Kanban tasks or
+    boards``. Listing is a READ, and a fenced board is already served read-only by
+    ``connect()`` (``?mode=ro``); attaching a promotion write to it made an ordinary
+    orchestrator's board view fail outright.
+
+    The fence itself is correct and must stay: this asserts the READ succeeds and
+    that the descendant still cannot promote or write anything.
+    """
+    import json as _json
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(key, raising=False)
+
+    # The owner initializes and seeds the board.
+    owner = connect(home / "kanban.db")
+    parent = kb.create_task(owner, title="parent")
+    # Still open, so this child sits in 'todo' until somebody runs the promotion.
+    child = kb.create_task(owner, title="child", parents=[parent])
+    assert kb.get_task(owner, child).status == "todo", "precondition: promotion is pending"
+    owner.close()
+
+    # A descendant with inherited scope over the same board.
+    _fenced_descendant_env(monkeypatch, tmp_path, home)
+    from agent.delegation_context import kanban_path_is_fenced
+    db_path = home / "kanban.db"
+    assert kanban_path_is_fenced(db_path), "precondition: the board is fenced"
+
+    listed = _json.loads(kanban_tools._handle_list({"limit": 50}))
+    assert "error" not in listed, listed
+    assert {t["id"] for t in listed["tasks"]} >= {parent, child}, listed
+    assert listed["count"] == len(listed["tasks"]), listed
+    # Truncation + filters still behave.
+    one = _json.loads(kanban_tools._handle_list({"limit": 1}))
+    assert one["truncated"] is True and one["count"] == 1, one
+    assert one["next_limit"] == 2, one
+    by_assignee = _json.loads(kanban_tools._handle_list({"limit": 50, "assignee": "nobody"}))
+    assert by_assignee["tasks"] == [], by_assignee
+
+    # promoted=0 is reported honestly rather than a fabricated count.
+    assert listed["promoted"] == 0, listed
+    # The descendant performed ZERO promotions: the gated child is still todo, and
+    # the owner's own recompute still promotes it -- i.e. the read neither advanced
+    # nor poisoned the parent's state.
+    after = connect(db_path)
+    assert kb.get_task(after, child).status == "todo", "a fenced read must not promote"
+    # The parent's promotion state is intact, not advanced and not poisoned: the
+    # gated child is still waiting on its parent, exactly as seeded.
+    assert kb.get_task(after, parent).status == "ready"
+    assert [pid for pid, _ in kb.unsatisfied_parents(after, child)] == [parent], "still gated by its parent"
+    assert after.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    after.close()
+
+
+def test_fenced_descendant_list_still_refuses_real_mutation(tmp_path, monkeypatch):
+    """The fence is NOT weakened by the read fix: real writes stay refused."""
+    import json as _json
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK",
+                "HERMES_DELEGATED_CHILD_CONTEXT"):
+        monkeypatch.delenv(key, raising=False)
+    owner = connect(home / "kanban.db")
+    existing = kb.create_task(owner, title="existing")
+    owner.close()
+
+    _fenced_descendant_env(monkeypatch, tmp_path, home)
+
+    # Direct DB mutation primitives are still denied.
+    conn = connect(home / "kanban.db")
+    for call in (
+        lambda: kb.create_task(conn, title="should not exist"),
+        lambda: kb.add_comment(conn, existing, "descendant", "should not exist"),
+        lambda: kb.set_current_board("other"),
+    ):
+        with pytest.raises(PermissionError):
+            call()
+    conn.close()
+
+    # Nothing was created or commented by the refused calls.
+    audit = connect(home / "kanban.db")
+    assert len(kb.list_tasks(audit)) == 1, "no task was created"
+    assert kb.list_comments(audit, existing) == [], "no comment was written"
+    audit.close()
+
+    # And the orchestrator-only creation tool is still refused for a descendant.
+    created = _json.loads(kanban_tools._handle_create({"title": "no", "assignee": "x"}))
+    assert "error" in created, created

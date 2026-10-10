@@ -707,7 +707,17 @@ def _handle_list(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         # Match CLI list: dependencies cleared since the last dispatcher tick
         # should be visible to orchestrators immediately.
-        promoted = kb.recompute_ready(conn)
+        #
+        # recompute_ready() opens a write transaction, so it is only legal on a
+        # board this context may actually mutate. Listing is a READ, and connect()
+        # already serves a fenced board read-only (?mode=ro); calling the promotion
+        # write unconditionally turned an ordinary read into
+        # "delegate_task child contexts cannot mutate Kanban tasks or boards" and
+        # broke the board view outright. On a fenced board we skip the promotion
+        # and report promoted=0 -- the descendant performs ZERO writes and the
+        # parent's own promotion state is left exactly as it was, rather than
+        # being advanced or poisoned by a reader that may not write.
+        promoted = kb.recompute_ready_if_writable(conn)
         # One extra row lets the output report truncation without dumping the board.
         rows = kb.list_tasks(
             conn, assignee=args.get("assignee"), status=args.get("status"),

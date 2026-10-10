@@ -2058,6 +2058,35 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def recompute_ready_if_writable(conn: sqlite3.Connection, failure_limit: Optional[int] = None) -> int:
+    """Recompute ready-dependencies ONLY when this context may write the board.
+
+    ``recompute_ready`` opens a write transaction, so a READ-shaped caller (the
+    native ``kanban_list`` tool and ``hermes kanban list``) must not invoke it
+    unconditionally: on a fenced board ``connect`` serves the DB read-only and the
+    write raises PermissionError, turning an ordinary board view into
+    "delegate_task child contexts cannot mutate Kanban tasks or boards".
+
+    Read paths call THIS instead, so the "cheap mini-dispatch" is skipped exactly
+    when it is illegal. A fenced reader performs zero writes and reports 0: the
+    owner's own promotion state is left untouched rather than advanced or poisoned.
+    Returns the promotion count (0 when skipped), so callers stay unchanged.
+    """
+    from agent.delegation_context import kanban_path_is_fenced
+
+    try:
+        # _main_db_file lives in kanban_db_connect, which imports THIS module;
+        # resolve it lazily to stay clear of the circular import boundary.
+        from hermes_cli.kanban_db_connect import _main_db_file
+
+        fenced = kanban_path_is_fenced(_main_db_file(conn))
+    except Exception:
+        fenced = True  # fail closed: never write what we cannot prove is allowed
+    if fenced:
+        return 0
+    return recompute_ready(conn, failure_limit=failure_limit)
+
+
 def recompute_ready(conn: sqlite3.Connection, failure_limit: int | None = None) -> int:
     """Promote ``todo``/``blocked`` tasks whose parents are all done/archived;
     returns the count. Opens its own IMMEDIATE txn — call OUTSIDE any write txn.
