@@ -366,9 +366,25 @@ _EMBED_MAX_DIMENSION = 1568
 # Target when auto-resizing after a provider size rejection (retry once).
 _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
 
+# How many times a size-classified rejection may trigger a further downscale. The
+# ladder halves the byte budget and the long edge each round (5 MB/1568px ->
+# 1.25 MB/784px -> ~312 KB/392px), so three attempts cover an image far larger than
+# any provider accepts while keeping the worst case bounded.
+_SIZE_RETRY_MAX_ATTEMPTS = 3
+
 _SIZE_ERROR_HINTS = (
     "too large", "payload", "413", "content_too_large",
     "request_too_large", "exceeds", "size limit",
+    # Self-hosted / reverse-proxied vision backends (S3 Lab llm.s3lab.io behind a
+    # 5xx-capable proxy) answer an oversized image with a generic transport failure
+    # instead of a 413: "proxy error: Failed to read connection" is vLLM/LiteLLM
+    # losing the upstream while streaming a multi-megabyte multimodal chunk. It is a
+    # SIZE symptom, so the downscale-and-retry ladder must engage on it — otherwise
+    # the caller gets an opaque 500 and the image is never retried smaller.
+    "failed to read connection", "error reading request body", "connection reset by peer",
+    # The vision encoder rejects an image whose pixel grid exceeds its own budget
+    # before the text ever reaches the model; a downscale is the only fix.
+    "mtmd chunk", "image too large", "max_pixels", "encoder error",
 )
 
 
@@ -911,14 +927,38 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if not (_is_image_size_error(_api_err) and len(image_data_url) > _RESIZE_TARGET_BYTES):
+            if not _is_image_size_error(_api_err):
                 raise
-            logger.info(
-                "API rejected image (%.1f MB, likely too large); auto-resizing to ~%.0f MB and retrying...",
-                len(image_data_url) / (1024 * 1024), _RESIZE_TARGET_BYTES / (1024 * 1024))
-            image_data_url = await _resize_prepared(prepared, _scale_info)
-            messages[0]["content"][1]["image_url"]["url"] = image_data_url
-            response = await async_call_llm(**call_kwargs)
+            # Retry whenever a downscale can still plausibly help. The old guard also
+            # required the payload to exceed _RESIZE_TARGET_BYTES (5 MB), which skipped
+            # exactly the images that fail here: a 2.5 MB screenshot trips the backend's
+            # streaming limit and returns a 500, so nothing was ever retried smaller.
+            # Retry while the payload is still above the embed budget (the floor below
+            # which a resize cannot reclaim anything) and while the attempt cap holds,
+            # so a pathological image degrades in steps instead of failing opaquely.
+            attempts = 0
+            floor = min(_RESIZE_TARGET_BYTES, _resolve_embed_target_bytes())
+            while attempts < _SIZE_RETRY_MAX_ATTEMPTS:
+                if len(image_data_url) <= floor:
+                    raise
+                attempts += 1
+                logger.info(
+                    "API rejected image (%.1f MB, %s); downscale attempt %d/%d and retrying...",
+                    len(image_data_url) / (1024 * 1024), _api_err, attempts, _SIZE_RETRY_MAX_ATTEMPTS)
+                image_data_url = await _resize_prepared(
+                    prepared, _scale_info,
+                    max_base64_bytes=_RESIZE_TARGET_BYTES >> (2 * (attempts - 1)),
+                    max_dimension=_EMBED_MAX_DIMENSION >> (attempts - 1),
+                    force_jpeg=True)
+                messages[0]["content"][1]["image_url"]["url"] = image_data_url
+                try:
+                    response = await async_call_llm(**call_kwargs)
+                    break
+                except Exception as _retry_err:
+                    if not _is_image_size_error(_retry_err):
+                        raise
+            else:
+                raise _api_err
         analysis = await _call_vision_llm(
             call_kwargs, "Vision LLM returned empty content, retrying once", response)
         return analysis, _build_scale_note(_scale_info or None, prepared.crop_offset or None)
