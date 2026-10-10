@@ -221,6 +221,7 @@ _DARWIN_ALL_PIDS = 1
 _DARWIN_PIDLISTFDS = 1
 _DARWIN_PIDFDVNODEPATHINFO = 2
 _DARWIN_PROC_FD_INFO_SIZE = 8  # struct proc_fdinfo { int32 proc_fd; uint32 proc_fdtype; }
+_DARWIN_FDTYPE_VNODE = 1  # PROX_FDTYPE_VNODE: the only fd type PROC_PIDFDVNODEPATHINFO describes
 _DARWIN_FD_RECORD_SIZE = 1200  # PROC_PIDFDVNODEPATHINFO_SIZE
 # Field offsets inside that 1200-byte record.  libproc does not lay the header's structs out
 # verbatim (it pads ``vnode_info`` and sizes the record to 1200, not to ``sizeof``'s 1192), so
@@ -277,16 +278,25 @@ def _darwin_all_pids(lib) -> list[int]:
         size *= 2
 
 
-def _iter_darwin_fd_targets():
+def _iter_darwin_fd_targets(stop: "Optional[threading.Event]" = None):
     """Yield ``(pid, fd, last pathname, (st_dev, st_ino))`` for every vnode fd libproc reports.
 
     The pathname and the identity both stay readable after the path is unlinked, which is what
     makes an orphaned WAL generation visible at all on macOS.  Processes that cannot be inspected
-    (gone, or not ours) and descriptors that are not vnodes are skipped silently."""
+    (gone, or not ours) and descriptors that are not vnodes are skipped silently.
+
+    The pass is linear in the number of descriptors: one process can hold hundreds of thousands
+    (the Docker Desktop VM keeps a host fd per virtiofs inode), so the fd listing is copied out of
+    its ctypes buffer once per process -- ``.raw`` copies the WHOLE buffer, and reading it per fd
+    made the pass quadratic -- and non-vnode descriptors never reach ``proc_pidfdinfo``.  Setting
+    *stop* ends the pass at the next descriptor, so a caller that abandoned it reclaims the CPU."""
     import ctypes
 
     lib = _darwin_libproc()
+    record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
     for pid in _darwin_all_pids(lib):
+        if stop is not None and stop.is_set():
+            return
         size = 4096
         while True:
             listing = ctypes.create_string_buffer(size)
@@ -298,9 +308,15 @@ def _iter_darwin_fd_targets():
             size *= 2
         else:
             continue
+        if used <= 0:
+            continue
+        fd_table = listing.raw[:used]
         for offset in range(0, used - _DARWIN_PROC_FD_INFO_SIZE + 1, _DARWIN_PROC_FD_INFO_SIZE):
-            fd = struct.unpack_from("<i", listing.raw, offset)[0]
-            record = ctypes.create_string_buffer(_DARWIN_FD_RECORD_SIZE)
+            if stop is not None and stop.is_set():
+                return
+            fd, fdtype = struct.unpack_from("<iI", fd_table, offset)
+            if fdtype != _DARWIN_FDTYPE_VNODE:
+                continue
             if lib.proc_pidfdinfo(pid, fd, _DARWIN_PIDFDVNODEPATHINFO, record,
                                   _DARWIN_FD_RECORD_SIZE) <= 0:
                 continue
@@ -324,10 +340,11 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
     holders: list[tuple[int, str]] = []
     errors: list[BaseException] = []
+    stop = threading.Event()
 
     def _scan() -> None:
         try:
-            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+            for pid, _fd, target, identity in _iter_darwin_fd_targets(stop):
                 literal = watched.get(target.casefold())
                 if literal is not None and _identity_is_truly_unlinked(identity, literal):
                     holders.append((pid, target))
@@ -337,10 +354,13 @@ def _iter_darwin_sidecar_holders(db_path) -> list[tuple[int, str]]:
     # ponytail: abandoned daemon thread per timed-out scan; a kernel-blocked
     # proc_pidfdinfo cannot be interrupted, so expiry leaks one thread that
     # dies with the process. Fail open: partial/empty holders, never a refusal.
+    # Expiry also sets ``stop``: a scan that was merely slow (not kernel-blocked)
+    # ends at its next descriptor instead of competing for the GIL forever.
     worker = threading.Thread(target=_scan, daemon=True)
     worker.start()
     worker.join(_DARWIN_FD_SCAN_TIMEOUT_SECONDS)
     if worker.is_alive():
+        stop.set()
         logger.warning(
             "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open",
             _DARWIN_FD_SCAN_TIMEOUT_SECONDS,
