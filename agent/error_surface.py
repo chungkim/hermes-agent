@@ -57,6 +57,16 @@ _NON_RETRYABLE_REASONS = {
     "context_overflow", "interpreter_shutdown", "upstream_blocked",
 }
 
+# Admission is a local backpressure decision, not a provider failure. Keep a
+# stable wire code and an explicit non-retryable verdict so advisory metadata
+# cannot become permission to replay a non-idempotent tool-call turn.
+_ADMISSION_REJECTED_CODE = "admission_rejected"
+
+# A selected provider-route budget is an explicit terminal verdict. It is not a
+# generic gateway timeout: exposing the stable code together with retryable=False
+# keeps advisory clients from turning a consumed budget into a replay/fallback.
+_PROVIDER_REQUEST_DEADLINE_CODE = "request_deadline_exceeded"
+
 # Providers whose base_url is user-supplied rather than a known vendor.
 _CUSTOM_ENDPOINT_PROVIDERS = {"custom", "local", "llama.cpp", "llamacpp", "ollama", "lmstudio", "vllm"}
 
@@ -169,6 +179,10 @@ def build_error_surface_from_result(result: Any, provider: str = "", model: str 
         # provider stack; hermes_state owns the pattern list.
         if error_text and _disk_full(error_text):
             return _surface(LAYER_DISK, "disk_full", False, provider, model)
+        if result.get("admission_rejected") is True:
+            return _surface(LAYER_PROVIDER, _ADMISSION_REJECTED_CODE, False, provider, model)
+        if result.get("provider_request_deadline") is True:
+            return _surface(LAYER_PROVIDER, _PROVIDER_REQUEST_DEADLINE_CODE, False, provider, model)
         if result.get("billing_block") or reason in ("billing", "billing_unverified"):
             return _surface(LAYER_BILLING, reason or "billing", False, provider, model)
         # The Nous free tier refused or could not serve the turn (``agent/turn_recovery.py``
@@ -212,6 +226,18 @@ def build_error_surface_from_exception(
         message = str(exc) or type(exc).__name__
         if _disk_full(exc):
             return _surface(LAYER_DISK, "disk_full", False, provider, model)
+        try:
+            from agent.provider_request_policy import ProviderAdmissionRejected
+        except Exception:
+            ProviderAdmissionRejected = None
+        if ProviderAdmissionRejected is not None and isinstance(exc, ProviderAdmissionRejected):
+            return _surface(LAYER_PROVIDER, _ADMISSION_REJECTED_CODE, False, provider, model)
+        try:
+            from agent.provider_request_policy import ProviderRequestDeadlineExceeded
+        except Exception:
+            ProviderRequestDeadlineExceeded = None
+        if ProviderRequestDeadlineExceeded is not None and isinstance(exc, ProviderRequestDeadlineExceeded):
+            return _surface(LAYER_PROVIDER, _PROVIDER_REQUEST_DEADLINE_CODE, False, provider, model)
         api_like = (type(exc).__module__ or "").split(".")[0] in _API_EXC_MODULE_PREFIXES or hasattr(exc, "status_code")
         if not api_like or not isinstance(exc, Exception):
             return _surface(LAYER_GATEWAY, type(exc).__name__, True, provider, model)
@@ -219,7 +245,11 @@ def build_error_surface_from_exception(
         from agent.error_classifier import classify_api_error
 
         classified = classify_api_error(exc, provider=provider, model=model, api_key=api_key)
-        synthetic = {"error": classified.message or message, "failure_reason": classified.reason.value}
+        synthetic = {
+            "error": classified.message or message,
+            "failure_reason": classified.reason.value,
+            "admission_rejected": classified.error_context.get("admission_rejected") is True,
+        }
         from agent.agent_runtime_helpers import extract_api_error_context
         from agent.credential_pool import _parse_absolute_timestamp
 

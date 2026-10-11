@@ -24,7 +24,10 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
-from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import (
     FailoverReason, PROVIDER_STREAM_EMPTY_FRAME_ERROR_CODE, PROVIDER_STREAM_NON_JSON_ERROR_CODE,
@@ -2741,7 +2744,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.api_kwargs = api_kwargs
         self.on_first_delta = on_first_delta
         self.worker = None  # request thread; None in inline mode
-        self.result = {"response": None, "error": None, "partial_tool_names": []}
+        self.result: dict[str, Any] = {"response": None, "error": None, "partial_tool_names": []}
         self.clients = _RequestClientRegistry(agent)
         # Request-local cancel flag: the worker recognizes its own interrupt
         # force-close (RemoteProtocolError) and exits instead of retrying (#6600).
@@ -2754,10 +2757,20 @@ class _StreamingCall(StreamingWaitMonitor):
         # Shared by the socket read timeout (``_stream_timeouts``) and the stale
         # detector (``_resolve_stale_timeout``); None until resolved.
         self._stream_stale_timeout = None
+        self._stream_first_byte_timeout = None
+        self._stream_total_timeout = None
+        self._stream_started_at = time.monotonic()
+        self._stream_timeout_error: TimeoutError | None = None
+        self._admission_lease = None
+        self._automatic_budget = None
         self.stream_attempt_lock = threading.Lock()
-        self.stream_attempt_state = {"current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0}
+        self.stream_attempt_state: dict[str, Any] = {
+            "current": 0, "cancelled": set(), "discarded_chunks": 0, "discarded_bytes": 0,
+        }
+        self._attempt_liveness: dict[int, dict[str, Any]] = {}
         self._stale_counted_attempts: set[int] = set()  # breaker counts each attempt once
         self.managed_stream_holder = {"stream": None}
+
         # Per-attempt: single-writer token, request-local client, raw HTTP response (chat wire).
         self._writer_token = self._attempt_request_client = self._attempt_stream_response = None
         # The route ``api_kwargs`` was assembled for; a retry must not replay it on another one.
@@ -2808,11 +2821,92 @@ class _StreamingCall(StreamingWaitMonitor):
         with self.stream_attempt_lock:
             self.stream_attempt_state["current"] += 1
             attempt_id = int(self.stream_attempt_state["current"])
+            self._attempt_liveness[attempt_id] = {
+                "last_progress_at": time.monotonic(),
+                "last_progress_wall": time.time(),
+                "first_chunk_at": None,
+            }
         self.provider_tool_in_flight["yes"] = False
         # Attempt-local like provider_tool_in_flight: a tool name from a stream that died
         # before any text must not label a later attempt's partial stub or its retry decision.
         self.result["partial_tool_names"] = []
         return attempt_id
+
+    def _legacy_attempt_liveness(self) -> dict:
+        """Adapt pre-attempt-state test doubles to the monotonic monitor contract."""
+        last_wall = time.time()
+        with contextlib.suppress(Exception):
+            last_wall = float(self.last_chunk_time["t"])
+        now_wall = time.time()
+        elapsed = max(0.0, now_wall - last_wall)
+        return {
+            "attempt_id": 0,
+            # Leave a tiny sampling margin so an exact 60-second legacy silence is
+            # not truncated to 59 by the monitor's integer display value.
+            "last_progress_at": time.monotonic() - elapsed - 1e-6,
+            "last_progress_wall": last_wall,
+            "first_chunk_at": None,
+        }
+
+    def _current_attempt_liveness(self) -> dict:
+        lock = getattr(self, "stream_attempt_lock", None)
+        state = getattr(self, "stream_attempt_state", None)
+        liveness_by_attempt = getattr(self, "_attempt_liveness", None)
+        if lock is None or not isinstance(state, dict) or not isinstance(liveness_by_attempt, dict):
+            return self._legacy_attempt_liveness()
+        with self.stream_attempt_lock:
+            attempt_id = int(self.stream_attempt_state["current"])
+            state = self._attempt_liveness.get(attempt_id)
+            if state is None:
+                state = self._attempt_liveness.setdefault(attempt_id, {
+                    "last_progress_at": time.monotonic(),
+                    "last_progress_wall": time.time(),
+                    "first_chunk_at": None,
+                })
+            return {"attempt_id": attempt_id, **state}
+
+    def _mark_attempt_progress(self, attempt_id: int, diag: dict, chunk: Any) -> bool:
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        if (getattr(self, "stream_attempt_lock", None) is None
+                or not isinstance(getattr(self, "stream_attempt_state", None), dict)
+                or not isinstance(getattr(self, "_attempt_liveness", None), dict)):
+            self.last_chunk_time["t"] = now_wall
+            with contextlib.suppress(Exception):
+                diag["chunks"] = int(diag.get("chunks", 0)) + 1
+                if diag.get("first_chunk_at") is None:
+                    diag["first_chunk_at"] = now_wall
+                diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
+            return True
+        with self.stream_attempt_lock:
+            state = self.stream_attempt_state
+            if attempt_id != int(state["current"]) or attempt_id in state["cancelled"]:
+                return False
+            liveness = self._attempt_liveness.setdefault(attempt_id, {})
+            liveness["last_progress_at"] = now_mono
+            liveness["last_progress_wall"] = now_wall
+            if liveness.get("first_chunk_at") is None:
+                liveness["first_chunk_at"] = now_mono
+        self.last_chunk_time["t"] = now_wall  # display/back-compat only; watchdog uses attempt-local state
+        with contextlib.suppress(Exception):
+            diag["chunks"] = int(diag.get("chunks", 0)) + 1
+            if diag.get("first_chunk_at") is None:
+                diag["first_chunk_at"] = now_wall
+            diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
+        return True
+
+    def _reset_attempt_liveness(self) -> None:
+        lock = getattr(self, "stream_attempt_lock", None)
+        state = getattr(self, "stream_attempt_state", None)
+        liveness_by_attempt = getattr(self, "_attempt_liveness", None)
+        if lock is None or not isinstance(state, dict) or not isinstance(liveness_by_attempt, dict):
+            self.last_chunk_time["t"] = time.time()
+            return
+        with self.stream_attempt_lock:
+            attempt_id = int(self.stream_attempt_state["current"])
+            liveness = self._attempt_liveness.setdefault(attempt_id, {})
+            liveness["last_progress_at"] = time.monotonic()
+            liveness["last_progress_wall"] = time.time()
 
     def _cancel_current_stream_attempt(self, reason: str) -> None:
         with self.stream_attempt_lock:
@@ -2883,18 +2977,36 @@ class _StreamingCall(StreamingWaitMonitor):
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
         self.clients.diag = diag
+        if self._automatic_budget is not None:
+            diag.update({
+                "provider_request_policy": True,
+                "stream_total_timeout_seconds": self._stream_total_timeout,
+                "stream_idle_timeout_seconds": self._stream_stale_timeout,
+                "stream_admission_limit": self._automatic_budget.max_concurrent,
+            })
+        if self._automatic_budget is not None:
+            # These are selected bounded values only; do not include request
+            # payloads, credentials, or provider response headers in telemetry.
+            diag.update({
+                "automatic_budget": True,
+                "selected_queue_timeout_seconds": round(self._automatic_budget.queue_timeout, 1),
+                "selected_first_byte_timeout_seconds": round(self._automatic_budget.first_byte_timeout, 1),
+                "selected_idle_timeout_seconds": round(self._automatic_budget.idle_timeout, 1),
+                "selected_total_timeout_seconds": round(self._automatic_budget.total_timeout, 1),
+            })
+            if self._admission_lease is not None:
+                diag.update({
+                    "admission_queue_position": self._admission_lease.queue_position,
+                    "admission_queue_wait_seconds": round(self._admission_lease.queue_wait_seconds, 3),
+                })
         return diag
 
-    def _count_chunk(self, diag, chunk) -> None:
+    def _count_chunk(self, diag, chunk, stream_attempt_id: int | None = None) -> None:
         """Stamp liveness for a real chunk; diagnostics are best-effort."""
-        self.last_chunk_time["t"] = time.time()
-        self.agent._touch_activity("receiving stream response")
-        with contextlib.suppress(Exception):
-            diag["chunks"] = int(diag.get("chunks", 0)) + 1
-            if diag.get("first_chunk_at") is None:
-                diag["first_chunk_at"] = self.last_chunk_time["t"]
-            # Delta-length estimate: ~3x cheaper than repr() per chunk.
-            diag["bytes"] = int(diag.get("bytes", 0)) + _estimate_chunk_bytes(chunk)
+        if stream_attempt_id is None:
+            stream_attempt_id = int(self.stream_attempt_state["current"])
+        if self._mark_attempt_progress(stream_attempt_id, diag, chunk):
+            self.agent._touch_activity("receiving stream response")
 
     @staticmethod
     def _mark_finish_seen(diag, finish_reason) -> None:
@@ -2909,6 +3021,15 @@ class _StreamingCall(StreamingWaitMonitor):
         ``request_timeout_seconds`` wins over HERMES_API_TIMEOUT (1800s) and
         HERMES_STREAM_READ_TIMEOUT (120s); connect/pool cover the handshake, not
         inference: 30s, or capped at 60s when configured."""
+        if self._automatic_budget is not None:
+            # The automatic route policy is authoritative for this exact
+            # endpoint/model; legacy config and global env values must not
+            # preempt its first-byte/idle budgets.
+            return (
+                self._automatic_budget.total_timeout,
+                max(self._automatic_budget.first_byte_timeout, self._automatic_budget.idle_timeout),
+                min(self._automatic_budget.total_timeout, 60.0),
+            )
         cfg = get_provider_request_timeout(self.agent.provider, self.agent.model)
         base = cfg if cfg is not None else env_float("HERMES_API_TIMEOUT", 1800.0)
         if cfg is not None:
@@ -2924,6 +3045,69 @@ class _StreamingCall(StreamingWaitMonitor):
             read = stale
             logger.debug("Cloud reasoning stream — read timeout raised to %.0fs to match stale-stream detector", read)
         return base, read, 30.0
+
+    def _resolve_request_budget(self) -> None:
+        """Resolve plugin-owned request budgets without changing other routes."""
+        from agent.provider_request_policy import automatic_policy_for_route, admission_for_route
+
+        policy = automatic_policy_for_route(self.agent.provider, self.agent.model, self.agent.base_url)
+        if policy is None:
+            return
+        gate = admission_for_route(self.agent.provider, self.agent.model, self.agent.base_url)
+        snapshot = gate.snapshot() if gate is not None else {}
+        budget = policy.with_derived_budgets(
+            context_tokens=estimate_request_context_tokens(self.api_kwargs),
+            active_requests=int(snapshot.get("active", 0)),
+        )
+        self._automatic_budget = budget
+        self._stream_first_byte_timeout = budget.first_byte_timeout
+        self._stream_stale_timeout = budget.idle_timeout
+        self._stream_total_timeout = budget.total_timeout
+
+    def _acquire_admission(self) -> None:
+        from agent.provider_request_policy import automatic_policy_for_route, admission_for_route
+        policy = automatic_policy_for_route(self.agent.provider, self.agent.model, self.agent.base_url)
+        if policy is None:
+            return
+        gate = admission_for_route(self.agent.provider, self.agent.model, self.agent.base_url)
+        if gate is None:
+            return
+        context_tokens = estimate_request_context_tokens(self.api_kwargs)
+        initial = gate.snapshot()
+        wait_budget = policy.with_derived_budgets(
+            context_tokens=context_tokens,
+            admission_position=int(initial.get("waiting", 0)) + 1,
+            active_requests=int(initial.get("active", 0)),
+        )
+        try:
+            lease = gate.acquire(timeout=wait_budget.queue_timeout)
+        except Exception:
+            logger.warning(
+                "Provider admission rejected (provider=%s model=%s)",
+                self.agent.provider, self.agent.model,
+            )
+            raise
+        self._admission_lease = lease
+        budget = policy.with_derived_budgets(
+            context_tokens=estimate_request_context_tokens(self.api_kwargs),
+            admission_position=lease.queue_position,
+            observed_queue_wait=lease.queue_wait_seconds,
+            active_requests=gate.snapshot()["active"],
+        )
+        self._automatic_budget = budget
+        self._stream_first_byte_timeout = budget.first_byte_timeout
+        self._stream_stale_timeout = budget.idle_timeout
+        self._stream_total_timeout = budget.total_timeout
+        # Queue waiting has its own bounded deadline. Start the request-local
+        # first-byte/idle/total clocks only after admission so queue pressure
+        # cannot consume the upstream request's total budget or stale window.
+        self._stream_started_at = time.monotonic()
+        logger.info(
+            "Provider admission granted (provider=%s model=%s queue_position=%d "
+            "queue_wait_s=%.3f selected_total_s=%.1f selected_idle_s=%.1f)",
+            self.agent.provider, self.agent.model, lease.queue_position, lease.queue_wait_seconds,
+            budget.total_timeout, budget.idle_timeout,
+        )
 
     @staticmethod
     def _choiceless_chunk(chunk, finish_reason):
@@ -2958,7 +3142,6 @@ class _StreamingCall(StreamingWaitMonitor):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
             self.agent._create_request_openai_client(reason="chat_completion_stream_request", api_kwargs=stream_kwargs))
-        self.last_chunk_time["t"] = time.time()
         self.agent._touch_activity("waiting for provider response (streaming)")
         # #93650: as above — the streaming path carries the same bulk
         # messages/tools payload and pays the same client-side walk.
@@ -3012,9 +3195,8 @@ class _StreamingCall(StreamingWaitMonitor):
             return False
         if not self._writer_still_current("Streaming"):
             return False
-        # Stamp BEFORE Relay processes the chunk so the watchdog can't cancel
-        # a live stream mid-interceptor.
-        self.last_chunk_time["t"] = time.time()
+        # Liveness was stamped by _count_chunk only after the attempt-local
+        # active check; a superseded chunk can no longer reset the watchdog.
         return True
 
     def _writer_still_current(self, label: str) -> bool:
@@ -3096,7 +3278,7 @@ class _StreamingCall(StreamingWaitMonitor):
                     self.agent._abort_request_openai_client(self._attempt_request_client, reason=reason)
 
         for chunk in _iter_provider_stream_chunks(stream, response=lambda: self._attempt_stream_response):
-            self._count_chunk(_diag, chunk)
+            self._count_chunk(_diag, chunk, stream_attempt_id)
             if self.agent._interrupt_requested:
                 _close_half_read_stream("interrupt_stream_close_failed")
                 break
@@ -3384,7 +3566,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 "treating as a mid-tool-call stream drop (#80498).")
         return message
 
-    def _call_anthropic(self, request_client):
+    def _call_anthropic(self, request_client, stream_attempt_id: int):
         """Stream an Anthropic Messages API response; fires delta callbacks but
         returns the native Message from get_final_message(). Runs on the
         per-request ``request_client`` so the watchdog can abort this socket
@@ -3393,7 +3575,6 @@ class _StreamingCall(StreamingWaitMonitor):
         # No message_stop -> EmptyStreamError; saw_stream_event only picks the message.
         saw_stream_event = False
         saw_message_stop = False
-        self.last_chunk_time["t"] = time.time()
         _diag = self._new_diag()
         self._writer_token = self._attempt_stream_response = None
         self._attempt_request_client = request_client
@@ -3431,7 +3612,7 @@ class _StreamingCall(StreamingWaitMonitor):
         try:
             for event in stream:
                 saw_stream_event = True
-                self._count_chunk(_diag, event)
+                self._count_chunk(_diag, event, stream_attempt_id)
                 if self.agent._interrupt_requested:
                     break
                 event_type = getattr(event, "type", None)
@@ -3519,7 +3700,12 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent, jittered_backoff(attempt + 1, base_delay=1.0, max_delay=4.0, jitter_ratio=0.0))
         # The backoff is not the dead attempt's silence: restart the stale clock so the
         # stale monitor cannot kill (and strike) a stream that has not reopened yet.
-        self.last_chunk_time["t"] = time.time()
+        reset_liveness = getattr(self, "_reset_attempt_liveness", None)
+        if callable(reset_liveness):
+            reset_liveness()
+        else:
+            # Compatibility for legacy test doubles that predate attempt-local state.
+            self.last_chunk_time["t"] = time.time()
 
     def _maybe_disable_streaming(self, e) -> None:
         """Flip to non-streaming for failures streaming itself cannot survive, or that
@@ -3734,7 +3920,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # Per-request client so the watchdog aborts its socket, not the shared one.
         request_client = self.clients.set_client(
             self.agent._create_request_anthropic_client(reason="anthropic_stream_request"), kind="anthropic_messages")
-        return self._call_anthropic(request_client)
+        return self._call_anthropic(request_client, stream_attempt_id)
 
     def _call(self):
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
@@ -3758,6 +3944,9 @@ class _StreamingCall(StreamingWaitMonitor):
                     return  # success
                 except Exception as e:
                     self._close_managed_stream()
+                    if self._stream_timeout_error is not None:
+                        self.result["error"] = self._stream_timeout_error
+                        return
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
                     if self._route_switched_under_request():
@@ -3834,6 +4023,13 @@ class _StreamingCall(StreamingWaitMonitor):
             "Stream stale for %.0fs (threshold %.0fs) — no chunks received. model=%s context=~%s tokens. Killing connection.",
             elapsed, self._stream_stale_timeout, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
         )
+        if self._automatic_budget is not None and isinstance(self.clients.diag, dict):
+            _phase = "first_byte" if not self.clients.diag.get("first_chunk_at") else "idle"
+            self.clients.diag.update({
+                "stream_timeout_phase": _phase,
+                "cancel_reason": f"{_phase}_timeout",
+                "cancelled_at": time.time(),
+            })
         self.agent._buffer_diagnostic_status(
             f"⚠️ No response from provider for {int(elapsed)}s (model: {self.api_kwargs.get('model', 'unknown')}, "
             f"context: ~{_est_ctx:,} tokens). Reconnecting...")
@@ -3845,9 +4041,9 @@ class _StreamingCall(StreamingWaitMonitor):
             self._cancel_current_stream_attempt("stale_stream_kill")
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
+        self._reset_attempt_liveness()
         self._count_stale_attempt()
         # Reset the timer so we don't kill repeatedly while the worker unwinds.
-        self.last_chunk_time["t"] = time.time()
         self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
         self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
 
@@ -3862,6 +4058,11 @@ class _StreamingCall(StreamingWaitMonitor):
         # Mark cancelled BEFORE force-closing so the worker treats the forced
         # transport error as a cancel, not a network error (#6600).
         self._request_cancelled["value"] = True
+        if self._automatic_budget is not None and isinstance(self.clients.diag, dict):
+            self.clients.diag.update({
+                "cancel_reason": "user_interrupt",
+                "cancelled_at": time.time(),
+            })
         logger.debug("Force-closing streaming httpx client due to interrupt (not a network error).")
         # Same as the stale kill: the pool sweep can miss the connection checked out for the
         # in-flight body read, so shut down the attempt's own socket too (#98974).
@@ -3877,6 +4078,32 @@ class _StreamingCall(StreamingWaitMonitor):
             _join_worker_for_relay_teardown(self.worker, label="Streaming")
         self._monitor_interrupted["yes"] = True
 
+
+    def _kill_total_stream(self, elapsed: float) -> None:
+        """Cancel the current attempt when a route-scoped wall-clock budget expires."""
+        if self._stream_timeout_error is not None:
+            return
+        from agent.provider_request_policy import ProviderRequestDeadlineExceeded
+        self._stream_timeout_error = ProviderRequestDeadlineExceeded(
+            f"Provider stream total timeout after {elapsed:.1f}s"
+        )
+        if isinstance(self.clients.diag, dict):
+            self.clients.diag.update({
+                "stream_timeout_phase": "total",
+                "cancel_reason": "total_timeout",
+                "cancelled_at": time.time(),
+            })
+        logger.warning(
+            "provider_stream_cancelled model=%s reason=total_timeout elapsed=%.1fs",
+            self.agent.model, elapsed,
+        )
+        self._request_cancelled["value"] = True
+        killed_response = self._attempt_stream_response
+        with contextlib.suppress(Exception):
+            self._cancel_current_stream_attempt("provider_total_timeout")
+            self.clients.close_once("provider_total_timeout")
+        self._shutdown_stale_attempt_socket(killed_response)
+
     # ── orchestration ───────────────────────────────────────────────────
 
     def _resolve_stale_timeout(self) -> None:
@@ -3885,6 +4112,10 @@ class _StreamingCall(StreamingWaitMonitor):
         HERMES_LOCAL_STREAM_STALE_TIMEOUT — an infinite one stalled sessions on a
         crashed endpoint forever. Cloud values scale with context size and are
         floored for known reasoning models (else BrokenPipeError from the gateway)."""
+        if self._automatic_budget is not None:
+            # _resolve_request_budget selected this route-scoped value before
+            # the monitor starts; do not replace it with a global/cloud floor.
+            return
         base = _configured_stale_base(self.agent)
         if base == 180.0 and self.agent.base_url and is_local_endpoint(self.agent.base_url):
             self._stream_stale_timeout = _local_stream_stale_timeout_default()
@@ -3951,7 +4182,7 @@ class _StreamingCall(StreamingWaitMonitor):
             _stub._content_filter_terminated = True
         return _stub
 
-    def run(self):
+    def _run_with_monitor(self):
         """Resolve the stale timeout, run the request (worker thread or inline),
         drive the heartbeat/stale/interrupt monitor, then translate the outcome."""
         self._resolve_stale_timeout()
@@ -3980,6 +4211,22 @@ class _StreamingCall(StreamingWaitMonitor):
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
         if self.result["error"] is not None:
             if self.deltas_were_sent["yes"]:
+                # A route-scoped total deadline is terminal even when the provider
+                # delivered part of the response.  Do not turn this consumed,
+                # potentially non-idempotent request into a length stub: the
+                # conversation loop would otherwise continue, retry, or fall
+                # back without the classifier's explicit non-retryable verdict.
+                _error = self.result["error"]
+                if (
+                    getattr(_error, "provider_request_deadline", False) is True
+                    and getattr(_error, "retryable", True) is False
+                ):
+                    logger.warning(
+                        "Provider request deadline exceeded after partial stream; "
+                        "preserving terminal error metadata: %s",
+                        _error,
+                    )
+                    raise _error
                 return self._partial_stream_stub()
             raise self.result["error"]
         if self.result["response"] is not None:
@@ -3988,6 +4235,17 @@ class _StreamingCall(StreamingWaitMonitor):
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])
         return self.result["response"]
+
+    def run(self):
+        try:
+            self._resolve_request_budget()
+            self._acquire_admission()
+            return self._run_with_monitor()
+        finally:
+            lease = self._admission_lease
+            self._admission_lease = None
+            if lease is not None:
+                lease.release("cancelled" if self._request_cancelled["value"] else "complete")
 
 
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):

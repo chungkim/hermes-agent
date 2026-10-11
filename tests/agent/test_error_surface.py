@@ -207,6 +207,68 @@ def test_exception_with_status_code_routes_through_classifier():
     assert surface["code"] in ("rate_limit", "upstream_rate_limit")
 
 
+def test_provider_admission_rejection_is_non_retryable_in_both_surfaces():
+    """Local admission backpressure must never look like retry/fallback authority."""
+    from agent.provider_request_policy import ProviderAdmissionRejected
+
+    result_surface = build_error_surface_from_result(
+        _failed_result(
+            "unknown",
+            error="provider admission queue is full",
+            failure_retryable=False,
+            admission_rejected=True,
+        ),
+        provider="test-provider",
+        model="test-model",
+    )
+    assert result_surface == {
+        "layer": LAYER_PROVIDER,
+        "code": "admission_rejected",
+        "retryable": False,
+        "provider": "test-provider",
+        "provider_label": "test-provider",
+        "model": "test-model",
+    }
+
+    exception_surface = build_error_surface_from_exception(
+        ProviderAdmissionRejected("provider admission queue is full"),
+        provider="test-provider",
+        model="test-model",
+    )
+    assert exception_surface == result_surface
+
+
+def test_provider_request_deadline_is_non_retryable_in_raw_and_terminal_surfaces():
+    """A consumed route budget is provider metadata, never gateway retry authority."""
+    from agent.provider_request_policy import ProviderRequestDeadlineExceeded
+
+    result_surface = build_error_surface_from_result(
+        _failed_result(
+            "unknown",
+            error="Provider stream total timeout after 300.0s",
+            failure_retryable=False,
+            provider_request_deadline=True,
+        ),
+        provider="test-provider",
+        model="test-model",
+    )
+    assert result_surface == {
+        "layer": LAYER_PROVIDER,
+        "code": "request_deadline_exceeded",
+        "retryable": False,
+        "provider": "test-provider",
+        "provider_label": "test-provider",
+        "model": "test-model",
+    }
+
+    exception_surface = build_error_surface_from_exception(
+        ProviderRequestDeadlineExceeded("selected total budget expired"),
+        provider="test-provider",
+        model="test-model",
+    )
+    assert exception_surface == result_surface
+
+
 def test_anthropic_usage_limit_routes_to_billing_recovery():
     class FakeAPIError(Exception):
         status_code = 429
