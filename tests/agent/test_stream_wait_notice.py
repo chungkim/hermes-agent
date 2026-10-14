@@ -1,14 +1,16 @@
 """Resumed chunks clear only the stream monitor's own silence notice."""
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from agent import chat_completion_helpers as h
+from agent import chat_completion_stream_monitor as monitor_module
 
 
 @pytest.mark.parametrize("local_loading,heartbeat_race", [(False, False), (True, False), (False, True)])
 def test_resumed_chunks_clear_wait_without_erasing_local_load(monkeypatch, local_loading, heartbeat_race):
-    call = h._StreamingCall.__new__(h._StreamingCall)
+    call: Any = h._StreamingCall.__new__(h._StreamingCall)
     notices, touches = [], []
     now = [1000.0]
     call.agent = SimpleNamespace(
@@ -55,3 +57,49 @@ def test_resumed_chunks_clear_wait_without_erasing_local_load(monkeypatch, local
         assert not any(text == "" for _, text in notices)
     else:
         assert notices[1:] == [(1060.4 if heartbeat_race else 1061.5, "")]
+
+
+def test_legacy_liveness_fallback_preserves_wall_clock_progress(monkeypatch):
+    monitor: Any = monitor_module.StreamingWaitMonitor.__new__(monitor_module.StreamingWaitMonitor)
+    monitor.last_chunk_time = {"t": 1000.0}
+    monkeypatch.setattr(monitor_module.time, "time", lambda: 1002.0)
+    monkeypatch.setattr(monitor_module.time, "monotonic", lambda: 5002.0)
+
+    state = monitor._stream_liveness()
+
+    assert state["attempt_id"] == 0
+    assert state["last_progress_wall"] == 1000.0
+    assert state["last_progress_at"] == 4999.999999
+    assert state["first_chunk_at"] is None
+
+
+def test_legacy_wait_notice_survives_monotonic_sampling_drift(monkeypatch):
+    """The compatibility path must not lose an exact wall-clock heartbeat."""
+    call: Any = h._StreamingCall.__new__(h._StreamingCall)
+    notices, touches = [], []
+    now = [1000.0]
+    monotonic_samples = iter([5000.0, 5000.2, 5000.0, 5000.2])
+    call.agent = SimpleNamespace(
+        base_url="https://example.com",
+        _interrupt_requested=False,
+        _emit_wait_notice=lambda text: notices.append((now[0], text)),
+        _touch_activity=lambda text: touches.append((now[0], text)),
+    )
+    call.api_kwargs = {"model": "test-model"}
+    call.last_chunk_time = {"t": 1000.0}
+    call._stream_stale_timeout = 180.0
+    monkeypatch.setattr(monitor_module.time, "time", lambda: now[0])
+    monkeypatch.setattr(monitor_module.time, "monotonic", lambda: next(monotonic_samples))
+
+    class Done:
+        def is_set(self):
+            return now[0] >= 1060.3
+
+        def wait(self, timeout):
+            del timeout
+            now[0] = 1060.0 if now[0] == 1000.0 else 1060.3
+
+    call._call_done = Done()
+    call._monitor_loop()
+
+    assert notices and notices[0][1]

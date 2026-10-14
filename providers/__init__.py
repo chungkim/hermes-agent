@@ -495,7 +495,12 @@ def _import_plugin_dir(plugin_dir: Path, source: str, *, home_key: str = "") -> 
             return
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        # Generic request-policy plugins need the same profile scope as the
+        # model-provider discovery that imports them. Bundled plugins are
+        # process-wide; user plugins stay isolated to their HERMES_HOME.
+        from agent.provider_request_policy import request_policy_scope
+        with request_policy_scope(None if source == "bundled" else home_key):
+            spec.loader.exec_module(module)
     except Exception as exc:
         logger.warning(
             "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc

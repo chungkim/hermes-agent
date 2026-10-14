@@ -1,0 +1,4 @@
+name: s3lab-qwen-request-policy
+kind: model-provider
+version: 0.1.0
+description: Provider request-policy plugin with bounded deadlines and admission for one exact route

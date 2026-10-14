@@ -985,6 +985,29 @@ def classify_api_error(
     The credential is never included in the returned context."""
     from hermes_cli.anon_auth import is_anonymous_request
     status_code = _extract_status_code(error)
+    from agent.provider_request_policy import ProviderAdmissionRejected
+    if isinstance(error, ProviderAdmissionRejected):
+        return ClassifiedError(
+            reason=FailoverReason.unknown,
+            status_code=status_code,
+            provider=provider,
+            model=model,
+            message=str(error),
+            error_context={"admission_rejected": True},
+            retryable=False,
+            should_fallback=False,
+        )
+    if getattr(error, "provider_request_deadline", False):
+        return ClassifiedError(
+            reason=FailoverReason.unknown,
+            status_code=status_code,
+            provider=provider,
+            model=model,
+            message=str(error),
+            error_context={"provider_request_deadline": True},
+            retryable=False,
+            should_fallback=False,
+        )
     # Copilot/GitHub Models RateLimitError may not set .status_code; force 429.
     if status_code is None and type(error).__name__ == "RateLimitError":
         status_code = 429
