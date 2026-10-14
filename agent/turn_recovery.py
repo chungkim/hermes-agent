@@ -1103,6 +1103,10 @@ def nonretryable_client_error_result(
         "failure_reason": classified.reason.value,
         "failure_retryable": bool(classified.retryable),
     })
+    if classified.error_context.get("admission_rejected") is True:
+        result["admission_rejected"] = True
+    if classified.error_context.get("provider_request_deadline") is True:
+        result["provider_request_deadline"] = True
     if _keep_partial:
         result["partial"] = True
     _stamp_limit_reset(result, agent, api_error)
@@ -1243,6 +1247,10 @@ def max_retries_exhausted_result(
         # Present only for billing walls: (provider, billing_url, is_nous, message).
         "billing_block": _billing_block,
     })
+    if classified.error_context.get("admission_rejected") is True:
+        result["admission_rejected"] = True
+    if classified.error_context.get("provider_request_deadline") is True:
+        result["provider_request_deadline"] = True
     # Retry-exhaustion after partial delivery (#119001): the text was already
     # shown, so keep it as the reply (marked failed) instead of an error-only
     # turn — the gateway flags ``partial`` and surfaces retain the bubble.
