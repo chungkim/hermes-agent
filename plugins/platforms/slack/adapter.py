@@ -1827,6 +1827,8 @@ class SlackAdapter(BasePlatformAdapter):
                 self._start_socket_mode_handler()
                 self._running = True
                 self._ensure_socket_watchdog()
+                # Publish the live adapter state for multiplexed profile-scoped status readers.
+                self._mark_connected()
             except Exception:
                 self._running = False
                 try:
